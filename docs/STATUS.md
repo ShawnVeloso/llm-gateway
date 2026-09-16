@@ -1,15 +1,16 @@
 # Status
 
 ## Current stage
-Stage 0 - context system and project skeleton. Skeleton + context system merged (PR #1); vendored skills + .gitattributes on branch `chore/vendor-skills`.
+Stage 1 - pass-through + logging, on branch `feature/stage-1-passthrough`. Stage 0 merged (PRs #1, #2).
 
 ## Done
 - uv project (`src/` layout), dependencies, ruff + pytest config.
 - Context system: CLAUDE.md, STATUS, ROADMAP, decision records, settings (deny rules, ruff hook), `/handoff` skill, `test-runner` and `docs-researcher` subagents.
 - Vendored skills: codebase-design, tdd, diagnosing-bugs, grilling/grill-me, resolving-merge-conflicts, frontend-design (see decision 0003).
+- Stage 1: `config.py` (Settings via pydantic-settings, fixed 127.0.0.1 bind) + `.env.example` + tests.
 
 ## Next step
-User merges the `chore/vendor-skills` PR. Then: `git switch main; git pull`, create `feature/stage-1-passthrough`, and implement Stage 1 starting with `config.py` + `.env.example`.
+Stage 1: model -> provider routing (longest prefix match), then provider clients (httpx) with respx-mocked tests.
 
 ## Open questions
 - Does Lithe call `GET /v1/models`? (Not in Stage 1 unless needed.)
