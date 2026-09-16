@@ -6,6 +6,7 @@ Stage 0 - context system and project skeleton (branch `chore/context-system`).
 ## Done
 - uv project (`src/` layout), dependencies, ruff + pytest config.
 - Context system: CLAUDE.md, STATUS, ROADMAP, decision records, settings (deny rules, ruff hook), `/handoff` skill, `test-runner` and `docs-researcher` subagents.
+- Vendored skills: codebase-design, tdd, diagnosing-bugs, grilling/grill-me, resolving-merge-conflicts, frontend-design (see decision 0003).
 
 ## Next step
 User merges the `chore/context-system` PR. Then: `git switch main; git pull`, create `feature/stage-1-passthrough`, and implement Stage 1 starting with `config.py` + `.env.example`.
