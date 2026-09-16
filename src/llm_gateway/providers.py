@@ -25,3 +25,16 @@ async def post_chat_completions(
     return await http.post(
         chat_completions_url(endpoint), json=payload, headers=auth_headers(endpoint)
     )
+
+
+async def open_chat_completions_stream(
+    http: httpx.AsyncClient, endpoint: ProviderEndpoint, payload: dict[str, Any]
+) -> httpx.Response:
+    """Send a request and return once headers arrive; the body is left unread for streaming.
+
+    The caller must `aclose()` the response.
+    """
+    request = http.build_request(
+        "POST", chat_completions_url(endpoint), json=payload, headers=auth_headers(endpoint)
+    )
+    return await http.send(request, stream=True)

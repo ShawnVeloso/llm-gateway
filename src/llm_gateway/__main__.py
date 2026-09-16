@@ -1,8 +1,14 @@
-"""Entry point for `uv run llm-gateway`. The server is implemented in Stage 1."""
+"""Entry point for `uv run llm-gateway`."""
+
+import uvicorn
+
+from llm_gateway.app import create_app
+from llm_gateway.config import HOST, get_settings
 
 
 def main() -> None:
-    raise SystemExit("llm-gateway is not implemented yet (Stage 1).")
+    settings = get_settings()
+    uvicorn.run(create_app(settings), host=HOST, port=settings.port)
 
 
 if __name__ == "__main__":
