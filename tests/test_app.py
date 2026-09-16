@@ -1,0 +1,67 @@
+import httpx
+import pytest
+import respx
+from fastapi.testclient import TestClient
+
+from llm_gateway.app import create_app
+from llm_gateway.config import Settings
+
+OLLAMA_URL = "http://localhost:11434/v1/chat/completions"
+COMPLETION = {
+    "id": "chatcmpl-1",
+    "object": "chat.completion",
+    "choices": [{"index": 0, "message": {"role": "assistant", "content": "hi"}}],
+}
+
+
+@pytest.fixture
+def client():
+    with TestClient(create_app(Settings(_env_file=None))) as client:
+        yield client
+
+
+def chat(model: str = "llama3.2", **extra) -> dict:
+    return {"model": model, "messages": [{"role": "user", "content": "hello"}], **extra}
+
+
+def test_health(client):
+    response = client.get("/health")
+
+    assert response.status_code == 200
+    assert response.json() == {"status": "ok"}
+
+
+@respx.mock
+def test_chat_completion_returns_provider_response(client):
+    respx.post(OLLAMA_URL).mock(return_value=httpx.Response(200, json=COMPLETION))
+
+    response = client.post("/v1/chat/completions", json=chat())
+
+    assert response.status_code == 200
+    assert response.json() == COMPLETION
+
+
+@respx.mock
+def test_service_error_status_and_body_reach_client(client):
+    response = client.post("/v1/chat/completions", json=chat("claude-sonnet-5"))
+
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "provider_not_configured"
+
+
+@pytest.mark.parametrize("content", [b"not json", b"[1, 2]"])
+def test_body_must_be_a_json_object(client, content):
+    response = client.post(
+        "/v1/chat/completions", content=content, headers={"Content-Type": "application/json"}
+    )
+
+    assert response.status_code == 400
+    assert response.json()["error"]["type"] == "invalid_request_error"
+
+
+@respx.mock
+def test_streaming_is_rejected_until_implemented(client):
+    response = client.post("/v1/chat/completions", json=chat(stream=True))
+
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "streaming_not_supported"
