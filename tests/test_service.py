@@ -152,3 +152,104 @@ async def test_non_json_success_body_is_a_bad_gateway(service):
 
     assert result.status_code == 502
     assert result.body["error"]["code"] == "invalid_upstream_response"
+
+
+# --- streaming ---
+
+USAGE = {"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5}
+SSE_EVENTS = [
+    b'data: {"choices":[{"delta":{"content":"hel"}}]}\n\n',
+    b'data: {"choices":[{"delta":{"content":"lo"}}]}\n\n',
+    b'data: {"choices":[],"usage":' + json.dumps(USAGE).encode() + b"}\n\n",
+    b"data: [DONE]\n\n",
+]
+
+
+def sse_response(chunks: list[bytes], error: Exception | None = None) -> httpx.Response:
+    async def body():
+        for chunk in chunks:
+            yield chunk
+        if error:
+            raise error
+
+    return httpx.Response(200, content=body(), headers={"Content-Type": "text/event-stream"})
+
+
+async def collect(stream) -> bytes:
+    return b"".join([chunk async for chunk in stream.chunks()])
+
+
+@respx.mock
+async def test_stream_relays_bytes_and_captures_usage(service):
+    route = respx.post(GEMINI_URL).mock(return_value=sse_response(SSE_EVENTS))
+
+    stream = await service.stream(
+        chat("gemini-2.5-flash", stream=True, stream_options={"custom": 1})
+    )
+    relayed = await collect(stream)
+
+    assert relayed == b"".join(SSE_EVENTS)
+    assert stream.usage == USAGE
+    assert stream.first_chunk_at is not None
+    assert stream.error_message is None
+    sent = json.loads(route.calls.last.request.content)
+    assert sent["stream"] is True
+    # Client's own stream options are kept; include_usage is added.
+    assert sent["stream_options"] == {"custom": 1, "include_usage": True}
+
+
+@respx.mock
+async def test_stream_usage_found_when_chunks_split_mid_line(service):
+    whole = b"".join(SSE_EVENTS)
+    pieces = [whole[i : i + 7] for i in range(0, len(whole), 7)]
+    respx.post(GEMINI_URL).mock(return_value=sse_response(pieces))
+
+    stream = await service.stream(chat("gemini-2.5-flash", stream=True))
+
+    assert await collect(stream) == whole
+    assert stream.usage == USAGE
+
+
+@respx.mock
+async def test_stream_without_usage_chunk_leaves_usage_none(service):
+    respx.post(GEMINI_URL).mock(return_value=sse_response([SSE_EVENTS[0], SSE_EVENTS[3]]))
+
+    stream = await service.stream(chat("gemini-2.5-flash", stream=True))
+    await collect(stream)
+
+    assert stream.usage is None
+
+
+@respx.mock
+async def test_stream_upstream_http_error_is_a_result_not_a_stream(service):
+    respx.post(GEMINI_URL).mock(
+        return_value=httpx.Response(401, json={"error": {"message": f"bad key {GEMINI_KEY}"}})
+    )
+
+    result = await service.stream(chat("gemini-2.5-flash", stream=True))
+
+    assert result.status_code == 401
+    assert "bad key" in result.body["error"]["message"]
+    assert GEMINI_KEY not in result.body["error"]["message"]
+
+
+async def test_stream_provider_not_configured(service):
+    result = await service.stream(chat("claude-sonnet-5", stream=True))
+
+    assert result.status_code == 400
+    assert result.body["error"]["code"] == "provider_not_configured"
+
+
+@respx.mock
+async def test_stream_broken_mid_way_ends_with_error_event(service):
+    respx.post(OLLAMA_URL).mock(
+        return_value=sse_response(SSE_EVENTS[:1], error=httpx.ReadError("connection reset"))
+    )
+
+    stream = await service.stream(chat("llama3.2", stream=True))
+    relayed = await collect(stream)
+
+    assert relayed.startswith(SSE_EVENTS[0])
+    last_event = json.loads(relayed.split(b"data: ")[-1])
+    assert last_event["error"]["type"] == "upstream_error"
+    assert "connection reset" in stream.error_message

@@ -10,10 +10,11 @@ Stage 1 - pass-through + logging, on branch `feature/stage-1-server`. Stage 0 me
 - Stage 1: `config.py` (Settings via pydantic-settings, fixed 127.0.0.1 bind) + `.env.example` + tests.
 - Stage 1: `routing.py` - model -> provider (Gemini/Ollama/OpenAI/Anthropic) via `provider/model` or longest prefix; missing key raises `ProviderNotConfiguredError` (decision 0004).
 - Stage 1: `providers.py` (one httpx POST for all providers) + `service.py` `ChatService.complete` (non-streaming): routes, strips `stream` flags, maps not-configured (400), upstream HTTP errors (status kept, key redacted), connect errors (502), timeouts (504) to OpenAI-style errors. Returns `ChatResult`, never raises.
-- Stage 1: `app.py` `create_app` - `GET /health`, `POST /v1/chat/completions` (non-streaming; `stream: true` gets a temporary 400), one shared `httpx.AsyncClient` per app via lifespan; `uv run llm-gateway` serves it with uvicorn on 127.0.0.1.
+- Stage 1: `app.py` `create_app` - `GET /health`, `POST /v1/chat/completions`, one shared `httpx.AsyncClient` per app via lifespan; `uv run llm-gateway` serves it with uvicorn on 127.0.0.1.
+- Stage 1: streaming - `ChatService.stream` returns a `ChatStream` (or a `ChatResult` if it fails before the first byte, so clients get a real HTTP error). Bytes relayed unchanged; gateway adds `stream_options.include_usage=true`; `ChatStream` records `usage`, `first_chunk_at`, and a mid-stream `error_message` (also sent to the client as an SSE error event). Live-checked with Ollama (normal + streaming, usage chunk present).
 
 ## Next step
-Stage 1: streaming - SSE pass-through in the service, add `stream_options.include_usage=true`, remove the temporary `streaming_not_supported` 400 in `app.py`. Then SQLite logging.
+Stage 1: SQLite logging - one row per request (fields in ROADMAP) written via `asyncio.to_thread`, using `ChatResult`/`ChatStream` stats; `X-App-Name` header. Then README (run + client setup) and live Gemini check.
 
 ## Open questions
 - Does Lithe call `GET /v1/models`? (Not in Stage 1 unless needed.)

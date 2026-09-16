@@ -60,8 +60,24 @@ def test_body_must_be_a_json_object(client, content):
 
 
 @respx.mock
-def test_streaming_is_rejected_until_implemented(client):
+def test_streaming_relays_sse_bytes(client):
+    sse = b'data: {"choices":[{"delta":{"content":"hi"}}]}\n\ndata: [DONE]\n\n'
+    respx.post(OLLAMA_URL).mock(
+        return_value=httpx.Response(200, content=sse, headers={"Content-Type": "text/event-stream"})
+    )
+
     response = client.post("/v1/chat/completions", json=chat(stream=True))
 
-    assert response.status_code == 400
-    assert response.json()["error"]["code"] == "streaming_not_supported"
+    assert response.status_code == 200
+    assert response.headers["Content-Type"].startswith("text/event-stream")
+    assert response.content == sse
+
+
+@respx.mock
+def test_streaming_error_before_first_byte_is_a_json_error(client):
+    respx.post(OLLAMA_URL).mock(side_effect=httpx.ConnectError("connection refused"))
+
+    response = client.post("/v1/chat/completions", json=chat(stream=True))
+
+    assert response.status_code == 502
+    assert response.json()["error"]["code"] == "upstream_unavailable"

@@ -6,10 +6,11 @@ from typing import Any
 
 import httpx
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
+from starlette.background import BackgroundTask
 
 from llm_gateway.config import Settings, get_settings
-from llm_gateway.service import ChatService
+from llm_gateway.service import ChatResult, ChatService
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
@@ -36,18 +37,22 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             return _error(400, "Request body must be valid JSON.", "invalid_request_error")
         if not isinstance(body, dict):
             return _error(400, "Request body must be a JSON object.", "invalid_request_error")
-        if body.get("stream") is True:
-            # Temporary until streaming lands: a JSON reply would break a client expecting SSE.
-            return _error(
-                400,
-                "Streaming is not supported by the gateway yet.",
-                "invalid_request_error",
-                "streaming_not_supported",
-            )
-
         chat: ChatService = request.app.state.chat
-        result = await chat.complete(body)
-        return JSONResponse(result.body, status_code=result.status_code)
+        if body.get("stream") is not True:
+            result = await chat.complete(body)
+            return JSONResponse(result.body, status_code=result.status_code)
+
+        stream = await chat.stream(body)
+        if isinstance(stream, ChatResult):
+            return JSONResponse(stream.body, status_code=stream.status_code)
+        return StreamingResponse(
+            stream.chunks(),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache"},
+            # chunks() closes upstream when it ends; this also covers a client that disconnects
+            # before the first chunk is read. Closing twice is harmless.
+            background=BackgroundTask(stream.aclose),
+        )
 
     return app
 
