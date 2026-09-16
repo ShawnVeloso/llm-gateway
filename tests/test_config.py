@@ -11,28 +11,12 @@ def make_settings(**overrides) -> Settings:
     return Settings(_env_file=None, **overrides)
 
 
-@pytest.fixture(autouse=True)
-def clean_env(monkeypatch):
-    for name in (
-        "PORT",
-        "GEMINI_API_KEY",
-        "GEMINI_BASE_URL",
-        "OLLAMA_BASE_URL",
-        "MODEL_PREFIXES",
-        "DEFAULT_PROVIDER",
-        "REQUEST_TIMEOUT_SECONDS",
-        "DB_PATH",
-        "LOG_CONTENT",
-    ):
-        monkeypatch.delenv(name, raising=False)
-
-
 def test_defaults():
     s = make_settings()
     assert s.port == 8787
     assert s.gemini_api_key is None
     assert s.default_provider == "ollama"
-    assert s.model_prefixes == {"gemini-": "gemini"}
+    assert s.model_prefixes["claude-"] == "anthropic"
     assert s.db_path == Path("data/gateway.db")
     assert s.log_content is False
 
@@ -47,6 +31,16 @@ def test_reads_env_vars(monkeypatch):
     assert s.log_content is True
 
 
+def test_endpoint_per_provider():
+    s = make_settings(anthropic_api_key="a-key")
+    anthropic = s.endpoint("anthropic")
+    assert anthropic.base_url == "https://api.anthropic.com/v1/"
+    assert anthropic.api_key.get_secret_value() == "a-key"
+    assert anthropic.key_env_var == "ANTHROPIC_API_KEY"
+    assert s.endpoint("openai").api_key is None
+    assert s.endpoint("ollama").needs_key is False
+
+
 def test_api_key_hidden_in_repr():
     s = make_settings(gemini_api_key="sk-test-secret")
     assert "sk-test-secret" not in repr(s)
@@ -56,8 +50,8 @@ def test_api_key_hidden_in_repr():
 @pytest.mark.parametrize(
     "overrides",
     [
-        {"default_provider": "openai"},
-        {"model_prefixes": {"gpt-": "openai"}},
+        {"default_provider": "mistral"},
+        {"model_prefixes": {"mistral-": "mistral"}},
         {"port": 0},
         {"request_timeout_seconds": 0},
     ],
