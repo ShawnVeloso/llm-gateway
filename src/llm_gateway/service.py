@@ -1,6 +1,6 @@
 """Request logic behind `/v1/chat/completions`: route, forward, and turn every failure into an
-OpenAI-style error. Later stages (retry, fallback, cache, logging) wrap `ChatService.complete`
-and `ChatService.stream`."""
+OpenAI-style error. Later stages (retry, fallback, cache) and logging (`request_log.LoggedChat`)
+wrap `ChatService.complete` and `ChatService.stream`."""
 
 import json
 import time
@@ -35,6 +35,7 @@ class ChatStream:
         self.usage: dict[str, Any] | None = None  # from the provider's usage chunk, if it sent one
         self.first_chunk_at: float | None = None  # time.perf_counter() of the first body bytes
         self.error_message: str | None = None  # set if the stream broke part-way; redacted
+        self.content_parts: list[str] = []  # assistant text deltas, in order
         self._response = response
         self._secrets = secrets
         self._buffer = b""
@@ -80,8 +81,16 @@ class ChatStream:
             event = json.loads(data)
         except ValueError:
             return
-        if isinstance(event, dict) and isinstance(event.get("usage"), dict):
+        if not isinstance(event, dict):
+            return
+        if isinstance(event.get("usage"), dict):
             self.usage = event["usage"]
+        choices = event.get("choices")
+        if isinstance(choices, list) and choices and isinstance(choices[0], dict):
+            delta = choices[0].get("delta")
+            content = delta.get("content") if isinstance(delta, dict) else None
+            if isinstance(content, str):
+                self.content_parts.append(content)
 
 
 class ChatService:

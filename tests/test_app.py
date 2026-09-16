@@ -15,8 +15,10 @@ COMPLETION = {
 
 
 @pytest.fixture
-def client():
-    with TestClient(create_app(Settings(_env_file=None))) as client:
+def client(tmp_path):
+    with TestClient(
+        create_app(Settings(_env_file=None, db_path=tmp_path / "gateway.db"))
+    ) as client:
         yield client
 
 
