@@ -1,0 +1,5 @@
+# Store and check out text files with LF so shell scripts and hooks work on Windows too.
+* text=auto eol=lf
+*.ps1 text eol=crlf
+*.bat text eol=crlf
+*.cmd text eol=crlf
