@@ -4,7 +4,8 @@ Each stage ships on its own branch(es) and must meet its acceptance criteria bef
 Design rule for every stage: later stages must fit without a rewrite (routes thin, one service call to wrap, schema migrations via `PRAGMA user_version`).
 
 ## Stage 1 - Pass-through + logging
-- `POST /v1/chat/completions` (OpenAI-compatible) forwards to Gemini or Ollama via their OpenAI-compatible endpoints; provider chosen from model name using a config prefix map + default provider.
+- `POST /v1/chat/completions` (OpenAI-compatible) forwards to Gemini, Ollama, OpenAI, or Anthropic via their OpenAI-compatible endpoints; provider chosen from model name using a config prefix map (longest match) + default provider, or pinned explicitly with `provider/model`. Switching models in a client needs no gateway code change (decision 0004).
+- A model whose provider has no API key configured gets a clear OpenAI-style error naming the missing setting, without calling upstream.
 - Streaming: SSE chunks passed through as they arrive; gateway adds `stream_options.include_usage=true`; usage stored when the provider sends it, NULL otherwise.
 - One SQLite row per request: timestamp, request id, app (`X-App-Name`, default `unknown`), provider, model, is_stream, input/output tokens, latency, TTFT (streams), HTTP status, error message.
 - Prompt/response text storage off by default (`LOG_CONTENT`).
@@ -12,7 +13,7 @@ Design rule for every stage: later stages must fit without a rewrite (routes thi
 - Config via `.env`; `.env.example` committed. Binds 127.0.0.1 only. `GET /health`.
 - Upstream failures return an OpenAI-style error and are logged. No retries/fallback.
 
-**Acceptance:** mocked tests pass for normal, streaming, provider error, and API-key-never-in-DB; ruff clean; README explains run + client setup with an empty Results section; live curl works for both providers (normal + streaming) and rows appear in the DB.
+**Acceptance:** mocked tests pass for normal, streaming, provider error, provider-not-configured, and API-key-never-in-DB; ruff clean; README explains run + client setup with an empty Results section; live curl works for Gemini and Ollama (normal + streaming) and rows appear in the DB (OpenAI/Anthropic live checks only if the owner has keys).
 
 ## Stage 2 - Retries + fallback
 - Retry transient upstream failures (connect errors, timeouts, 429/5xx) with backoff; automatic fallback Gemini -> Ollama with a configured model mapping.
