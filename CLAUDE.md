@@ -41,6 +41,7 @@ A local server on the user's Windows PC that sits between their apps (Lithe desk
 - Same correction from the user twice -> add a one-line rule here. Near 100 lines -> condense or move detail out.
 - Tell the user when the conversation is heavy and it's a good time to `/handoff` and start fresh.
 - External docs lookups go through the `docs-researcher` subagent.
+- Third-party skills in `.claude/skills/` are vendored verbatim; rules in this file win on any conflict (e.g. never rebase or abort a merge without asking). "ADRs" in skills = `docs/decisions/`.
 
 ## Read when
 | Trigger | Read |
@@ -48,5 +49,6 @@ A local server on the user's Windows PC that sits between their apps (Lithe desk
 | Picking, scoping, or checking done-ness of work | `docs/ROADMAP.md` |
 | "Why is it built this way?" / before changing a past decision | `ls docs/decisions/`, then the one matching file |
 | Making a new decision worth recording | `docs/decisions/0000-template.md` |
+| Adding or updating a third-party skill | `docs/decisions/0003-third-party-skills.md` |
 | Human-facing usage (run, client setup) | `README.md` |
 | Ending a session | run `/handoff` |
