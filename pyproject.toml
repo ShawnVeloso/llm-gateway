@@ -1,0 +1,47 @@
+[project]
+name = "llm-gateway"
+version = "0.1.0"
+description = "Local OpenAI-compatible gateway that forwards chat requests to Gemini or Ollama and logs each request."
+authors = [
+    { name = "Shoni", email = "23101198@usc.edu.ph" }
+]
+requires-python = ">=3.13"
+dependencies = [
+    "fastapi>=0.141.1",
+    "httpx>=0.28.1",
+    "pydantic-settings>=2.15.0",
+    "uvicorn[standard]>=0.53.0",
+]
+
+[project.scripts]
+llm-gateway = "llm_gateway.__main__:main"
+
+[build-system]
+requires = ["uv_build>=0.12.5,<0.13.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "anyio>=4.15.1",
+    "pytest>=9.1.1",
+    "respx>=0.23.1",
+    "ruff>=0.16.7",
+]
+
+[tool.uv]
+# The uv cache (C:) and the project (D:) are on different drives, so hardlinks fail.
+link-mode = "copy"
+
+[tool.ruff]
+line-length = 100
+target-version = "py313"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "ASYNC", "S", "SIM"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S101"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"

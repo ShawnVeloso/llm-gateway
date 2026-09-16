@@ -1,0 +1,56 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-settings.json",
+  "autoMemoryEnabled": false,
+  "permissions": {
+    "deny": [
+      "Read(.env)",
+      "Read(.env.*)",
+      "Read(!.env.example)",
+      "Read(**/*.db)",
+      "Read(**/*.db-*)",
+      "Read(**/*.sqlite*)",
+      "Read(**/*.log)",
+      "Read(data/**)",
+      "Read(.venv/**)",
+      "Read(**/__pycache__/**)",
+      "Read(.pytest_cache/**)",
+      "Read(.ruff_cache/**)",
+      "Bash(cat *.env*)",
+      "Bash(cat .env*)",
+      "Bash(less *.env*)",
+      "Bash(head *.env*)",
+      "Bash(tail *.env*)",
+      "PowerShell(Get-Content *.env*)",
+      "Bash(git push --force*)",
+      "Bash(git push -f*)",
+      "Bash(git push * --force*)",
+      "Bash(git push * -f*)",
+      "Bash(git reset --hard*)",
+      "Bash(git rebase*)",
+      "Bash(gh pr merge*)",
+      "PowerShell(git push --force*)",
+      "PowerShell(git push -f*)",
+      "PowerShell(git push * --force*)",
+      "PowerShell(git push * -f*)",
+      "PowerShell(git reset --hard*)",
+      "PowerShell(git rebase*)",
+      "PowerShell(gh pr merge*)"
+    ]
+  },
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Write|Edit",
+        "hooks": [
+          {
+            "type": "command",
+            "shell": "bash",
+            "command": "python \"${CLAUDE_PROJECT_DIR}/.claude/hooks/ruff_on_edit.py\"",
+            "timeout": 60,
+            "statusMessage": "ruff format + lint"
+          }
+        ]
+      }
+    ]
+  }
+}
