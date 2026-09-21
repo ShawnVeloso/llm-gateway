@@ -1,6 +1,7 @@
 import asyncio
 import json
 import sqlite3
+from contextlib import closing
 from dataclasses import replace
 from uuid import uuid4
 
@@ -11,7 +12,7 @@ from fastapi.testclient import TestClient
 
 from llm_gateway.app import create_app
 from llm_gateway.config import Settings
-from llm_gateway.request_log import CLIENT_DISCONNECTED, RequestLog, RequestRecord
+from llm_gateway.request_log import CLIENT_DISCONNECTED, MIGRATIONS, RequestLog, RequestRecord
 
 GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
 OLLAMA_URL = "http://localhost:11434/v1/chat/completions"
@@ -34,7 +35,13 @@ SSE = (
 def make_client(tmp_path, **settings) -> tuple[TestClient, RequestLog]:
     db_path = tmp_path / "logs" / "gateway.db"  # missing folder: startup must create it
     app = create_app(
-        Settings(_env_file=None, db_path=db_path, gemini_api_key=GEMINI_KEY, **settings)
+        Settings(
+            _env_file=None,
+            db_path=db_path,
+            gemini_api_key=GEMINI_KEY,
+            retry_base_delay_seconds=0,
+            **settings,
+        )
     )
     return TestClient(app), RequestLog(db_path)
 
@@ -141,6 +148,60 @@ def test_provider_error_is_logged_without_api_key(tmp_path, stream):
     assert GEMINI_KEY not in dump
 
 
+@respx.mock
+@pytest.mark.parametrize("stream", [False, True])
+def test_fallback_logs_every_attempt_and_the_serving_provider(tmp_path, stream):
+    respx.post(GEMINI_URL).mock(
+        return_value=httpx.Response(503, json={"error": {"message": f"busy {GEMINI_KEY}"}})
+    )
+    respx.post(OLLAMA_URL).mock(
+        return_value=sse_response(SSE) if stream else httpx.Response(200, json=COMPLETION)
+    )
+    client, log = make_client(tmp_path)
+
+    with client:
+        response = client.post("/v1/chat/completions", json=chat("gemini-3.6-flash", stream=stream))
+        [row] = log.rows()
+        attempts = log.rows("attempts")
+
+    assert response.status_code == 200
+    assert (row["provider"], row["model"]) == ("ollama", "qwen2.5")
+    assert row["requested_model"] == "gemini-3.6-flash"
+    assert row["status_code"] == 200
+    assert row["attempt_count"] == 4
+    assert [(a["attempt_number"], a["provider"], a["status_code"]) for a in attempts] == [
+        (1, "gemini", 503),
+        (2, "gemini", 503),
+        (3, "gemini", 503),
+        (4, "ollama", 200),
+    ]
+    assert {a["request_id"] for a in attempts} == {row["request_id"]}
+    assert "busy" in attempts[0]["error_message"]
+    assert attempts[3]["model"] == "qwen2.5"
+    dump = "\n".join(sqlite3.connect(log.path).iterdump())
+    assert GEMINI_KEY not in dump
+
+
+def test_stage_1_log_is_upgraded_in_place(tmp_path):
+    log = RequestLog(tmp_path / "gateway.db")
+    with sqlite3.connect(log.path) as db:  # what Stage 1 left behind: no user_version
+        db.execute(MIGRATIONS[0])
+        db.execute(
+            "INSERT INTO requests (request_id, created_at, app, is_stream, latency_ms, "
+            "status_code) VALUES ('old', '2026-09-01T00:00:00+00:00', 'lithe', 0, 1.0, 200)"
+        )
+
+    log.create()
+    log.create()  # a second startup changes nothing
+
+    [row] = log.rows()
+    assert row["request_id"] == "old"
+    assert row["attempt_count"] is None  # unknown for rows from before Stage 2
+    assert log.rows("attempts") == []
+    with closing(sqlite3.connect(log.path)) as db:
+        assert db.execute("PRAGMA user_version").fetchone() == (len(MIGRATIONS),)
+
+
 def test_provider_not_configured_is_logged(tmp_path):
     client, log = make_client(tmp_path)
 
@@ -151,6 +212,7 @@ def test_provider_not_configured_is_logged(tmp_path):
     assert row["status_code"] == 400
     assert row["provider"] is None
     assert row["model"] == "claude-sonnet-5"
+    assert row["attempt_count"] == 0
     assert "ANTHROPIC_API_KEY" in row["error_message"]
 
 
@@ -245,7 +307,13 @@ async def test_write_completes_even_if_caller_is_cancelled(tmp_path):
     log = RequestLog(tmp_path / "gateway.db")
     log.create()
     empty = dict.fromkeys(RequestRecord.__dataclass_fields__)
-    fields = {"app": "test", "is_stream": False, "latency_ms": 1.0, "status_code": 200}
+    fields = {
+        "app": "test",
+        "is_stream": False,
+        "latency_ms": 1.0,
+        "status_code": 200,
+        "attempts": (),
+    }
     record = RequestRecord(**{**empty, **fields, "created_at": "2026-01-01T00:00:00+00:00"})
 
     for _ in range(20):  # the unprotected version loses the race most of the time, not always

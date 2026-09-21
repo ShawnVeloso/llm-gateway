@@ -12,42 +12,73 @@ from contextlib import closing
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
-from llm_gateway.service import ChatResult, ChatService, ChatStream
+from llm_gateway.service import Attempt, ChatResult, ChatService, ChatStream
 
 logger = logging.getLogger(__name__)
 
 CLIENT_DISCONNECTED = "Client disconnected before the stream finished."
 
-SCHEMA = """
-CREATE TABLE IF NOT EXISTS requests (
-    id INTEGER PRIMARY KEY,
-    request_id TEXT NOT NULL UNIQUE,
-    created_at TEXT NOT NULL,         -- UTC, ISO 8601, when the request arrived
-    app TEXT NOT NULL,                -- X-App-Name header, or 'unknown'
-    provider TEXT,                    -- NULL if the request failed before routing
-    model TEXT,                       -- name sent upstream, else the name the client asked for
-    is_stream INTEGER NOT NULL,
-    input_tokens INTEGER,             -- only as reported by the provider, never estimated
-    output_tokens INTEGER,
-    latency_ms REAL NOT NULL,         -- until the last byte (streams) or the full response
-    ttft_ms REAL,                     -- streams only: until the first bytes arrived
-    status_code INTEGER NOT NULL,
-    error_message TEXT,               -- redacted
-    request_content TEXT,             -- JSON messages; only when LOG_CONTENT=true
-    response_content TEXT             -- assistant text; only when LOG_CONTENT=true
-)
-"""
+# Schema changes, in order. The DB's `PRAGMA user_version` counts how many have been applied, so
+# an existing log is upgraded in place at startup. Only ever append; never edit a shipped entry.
+MIGRATIONS = [
+    # 1 (Stage 1). IF NOT EXISTS: Stage 1 created this table without setting user_version.
+    """
+    CREATE TABLE IF NOT EXISTS requests (
+        id INTEGER PRIMARY KEY,
+        request_id TEXT NOT NULL UNIQUE,
+        created_at TEXT NOT NULL,         -- UTC, ISO 8601, when the request arrived
+        app TEXT NOT NULL,                -- X-App-Name header, or 'unknown'
+        provider TEXT,                    -- who served it (or failed last); NULL if never routed
+        model TEXT,                       -- name sent upstream, else the name the client asked for
+        is_stream INTEGER NOT NULL,
+        input_tokens INTEGER,             -- only as reported by the provider, never estimated
+        output_tokens INTEGER,
+        latency_ms REAL NOT NULL,         -- until the last byte (streams) or the full response
+        ttft_ms REAL,                     -- streams only: until the first bytes arrived
+        status_code INTEGER NOT NULL,
+        error_message TEXT,               -- redacted
+        request_content TEXT,             -- JSON messages; only when LOG_CONTENT=true
+        response_content TEXT             -- assistant text; only when LOG_CONTENT=true
+    );
+    """,
+    # 2 (Stage 2): retries and fallback. Rows from before this have NULL in the new columns.
+    """
+    ALTER TABLE requests ADD COLUMN requested_model TEXT;   -- as the client sent it
+    ALTER TABLE requests ADD COLUMN attempt_count INTEGER;  -- upstream calls; 0 if never routed
+    CREATE TABLE attempts (
+        id INTEGER PRIMARY KEY,
+        request_id TEXT NOT NULL REFERENCES requests (request_id),
+        attempt_number INTEGER NOT NULL,  -- 1, 2, ... across retries and fallback
+        provider TEXT NOT NULL,
+        model TEXT NOT NULL,              -- name sent upstream
+        status_code INTEGER NOT NULL,
+        latency_ms REAL NOT NULL,         -- until the full response, or a stream's first bytes
+        error_message TEXT                -- redacted
+    );
+    CREATE INDEX attempts_request_id ON attempts (request_id);
+    """,
+]
 
 
 INSERT = """
 INSERT INTO requests (
-    request_id, created_at, app, provider, model, is_stream, input_tokens, output_tokens,
-    latency_ms, ttft_ms, status_code, error_message, request_content, response_content
+    request_id, created_at, app, provider, model, requested_model, is_stream, input_tokens,
+    output_tokens, latency_ms, ttft_ms, status_code, error_message, attempt_count,
+    request_content, response_content
 ) VALUES (
-    :request_id, :created_at, :app, :provider, :model, :is_stream, :input_tokens, :output_tokens,
-    :latency_ms, :ttft_ms, :status_code, :error_message, :request_content, :response_content
+    :request_id, :created_at, :app, :provider, :model, :requested_model, :is_stream, :input_tokens,
+    :output_tokens, :latency_ms, :ttft_ms, :status_code, :error_message, :attempt_count,
+    :request_content, :response_content
+)
+"""
+
+INSERT_ATTEMPT = """
+INSERT INTO attempts (
+    request_id, attempt_number, provider, model, status_code, latency_ms, error_message
+) VALUES (
+    :request_id, :attempt_number, :provider, :model, :status_code, :latency_ms, :error_message
 )
 """
 
@@ -59,6 +90,7 @@ class RequestRecord:
     app: str
     provider: str | None
     model: str | None
+    requested_model: str | None
     is_stream: bool
     input_tokens: int | None
     output_tokens: int | None
@@ -68,6 +100,7 @@ class RequestRecord:
     error_message: str | None
     request_content: str | None
     response_content: str | None
+    attempts: tuple[Attempt, ...]  # written to the `attempts` table; the count to `requests`
 
 
 class RequestLog:
@@ -76,12 +109,16 @@ class RequestLog:
         self._pending: set[asyncio.Task[None]] = set()
 
     def create(self) -> None:
-        """Create the DB file and table if missing. Blocking; call once at startup."""
+        """Create the DB file and bring its schema up to date. Blocking; call once at startup."""
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        with closing(sqlite3.connect(self.path)) as db, db:
+        with closing(sqlite3.connect(self.path)) as db:
             # WAL lets a dashboard read the DB while the gateway is writing to it.
             db.execute("PRAGMA journal_mode=WAL")
-            db.execute(SCHEMA)
+            [version] = db.execute("PRAGMA user_version").fetchone()
+            for number, script in enumerate(MIGRATIONS[version:], start=version + 1):
+                # One transaction per migration, version bump included: a failure leaves the DB
+                # as it was (the connection closes without COMMIT, which rolls back).
+                db.executescript(f"BEGIN;\n{script}\nPRAGMA user_version = {number};\nCOMMIT;")
 
     async def write(self, record: RequestRecord) -> None:
         """Insert a row off the event loop. A logging failure never fails the request.
@@ -107,14 +144,23 @@ class RequestLog:
     def _insert(self, record: RequestRecord) -> None:
         # A connection per write: SQLite connections can't be shared across to_thread's threads,
         # and opening a local file is cheap next to an LLM call.
+        row = {name: getattr(record, name) for name in RequestRecord.__dataclass_fields__}
+        row["attempt_count"] = len(record.attempts)
+        attempts = [
+            {"request_id": record.request_id, "attempt_number": number, **asdict(attempt)}
+            for number, attempt in enumerate(record.attempts, start=1)
+        ]
+        # One transaction, so a request never appears without its attempts.
         with closing(sqlite3.connect(self.path, timeout=5)) as db, db:
-            db.execute(INSERT, asdict(record))
+            db.execute(INSERT, row)
+            db.executemany(INSERT_ATTEMPT, attempts)
 
-    def rows(self) -> list[dict[str, Any]]:
-        """All rows, oldest first. Blocking; for tests and quick checks."""
+    def rows(self, table: Literal["requests", "attempts"] = "requests") -> list[dict[str, Any]]:
+        """All rows of a table, oldest first. Blocking; for tests and quick checks."""
         with closing(sqlite3.connect(self.path)) as db:
             db.row_factory = sqlite3.Row
-            return [dict(row) for row in db.execute("SELECT * FROM requests ORDER BY id")]
+            query = f"SELECT * FROM {table} ORDER BY id"  # noqa: S608 - table is one of two names
+            return [dict(row) for row in db.execute(query)]
 
 
 class LoggedChat:
@@ -161,7 +207,7 @@ class LoggedChat:
         if error is None and not finished:
             error = CLIENT_DISCONNECTED
         # 200 because that's the status the client already received.
-        result = ChatResult(200, {}, stream.provider, stream.model, error)
+        result = ChatResult(200, {}, stream.provider, stream.model, error, stream.attempts)
         ttft = None
         if stream.first_chunk_at is not None:
             ttft = (stream.first_chunk_at - start.perf) * 1000
@@ -195,6 +241,7 @@ class LoggedChat:
             app=app,
             provider=result.provider,
             model=result.model or (requested if isinstance(requested, str) else None),
+            requested_model=requested if isinstance(requested, str) else None,
             is_stream=is_stream,
             input_tokens=_token_count(usage, "prompt_tokens"),
             output_tokens=_token_count(usage, "completion_tokens"),
@@ -204,6 +251,7 @@ class LoggedChat:
             error_message=result.error_message,
             request_content=json.dumps(body.get("messages")) if self._log_content else None,
             response_content=(response_text or None) if self._log_content else None,
+            attempts=result.attempts,
         )
 
 

@@ -26,11 +26,23 @@ def anyio_backend():
     return "asyncio"
 
 
+def make_settings(**overrides) -> Settings:
+    # No backoff waits, so retry tests run instantly.
+    return Settings(
+        _env_file=None, gemini_api_key=GEMINI_KEY, retry_base_delay_seconds=0, **overrides
+    )
+
+
 @pytest.fixture
 async def service():
-    settings = Settings(_env_file=None, gemini_api_key=GEMINI_KEY)
     async with httpx.AsyncClient() as http:
-        yield ChatService(settings, http)
+        yield ChatService(make_settings(), http)
+
+
+@pytest.fixture
+async def no_fallback_service():
+    async with httpx.AsyncClient() as http:
+        yield ChatService(make_settings(fallback_models={}), http)
 
 
 def chat(model: str, **extra) -> dict:
@@ -117,10 +129,10 @@ async def test_upstream_error_keeps_status_and_redacts_key(service, upstream_bod
 
 
 @respx.mock
-async def test_upstream_rate_limit_status_passes_through(service):
+async def test_upstream_rate_limit_status_passes_through(no_fallback_service):
     respx.post(GEMINI_URL).mock(return_value=httpx.Response(429, text="slow down"))
 
-    result = await service.complete(chat("gemini-2.5-flash"))
+    result = await no_fallback_service.complete(chat("gemini-2.5-flash"))
 
     assert result.status_code == 429
     assert "slow down" in result.body["error"]["message"]
@@ -142,6 +154,7 @@ async def test_transport_failures_become_gateway_errors(service, exc, status, co
     assert result.status_code == status
     assert result.body["error"]["code"] == code
     assert result.provider == "ollama"
+    assert len(result.attempts) == 3  # retried; Ollama has no fallback
 
 
 @respx.mock
@@ -253,3 +266,157 @@ async def test_stream_broken_mid_way_ends_with_error_event(service):
     last_event = json.loads(relayed.split(b"data: ")[-1])
     assert last_event["error"]["type"] == "upstream_error"
     assert "connection reset" in stream.error_message
+
+
+# --- retries and fallback ---
+
+FALLBACK_COMPLETION = {**COMPLETION, "model": "qwen2.5"}
+
+
+def tries(outcome) -> list[tuple[str, int]]:
+    return [(attempt.provider, attempt.status_code) for attempt in outcome.attempts]
+
+
+@respx.mock
+async def test_transient_error_is_retried_then_succeeds(service):
+    gemini = respx.post(GEMINI_URL).mock(
+        side_effect=[httpx.Response(503, text="overloaded"), httpx.Response(200, json=COMPLETION)]
+    )
+
+    result = await service.complete(chat("gemini-3.6-flash"))
+
+    assert result.status_code == 200
+    assert result.provider == "gemini"
+    assert gemini.call_count == 2
+    assert tries(result) == [("gemini", 503), ("gemini", 200)]
+    assert "overloaded" in result.attempts[0].error_message
+    assert result.attempts[1].error_message is None
+
+
+@respx.mock
+async def test_connect_error_is_retried(service):
+    respx.post(OLLAMA_URL).mock(
+        side_effect=[httpx.ConnectError("refused"), httpx.Response(200, json=COMPLETION)]
+    )
+
+    result = await service.complete(chat("llama3.2"))
+
+    assert result.status_code == 200
+    assert tries(result) == [("ollama", 502), ("ollama", 200)]
+
+
+@respx.mock
+async def test_retries_exhausted_falls_back_to_configured_model(service):
+    gemini = respx.post(GEMINI_URL).mock(return_value=httpx.Response(503))
+    ollama = respx.post(OLLAMA_URL).mock(return_value=httpx.Response(200, json=FALLBACK_COMPLETION))
+
+    result = await service.complete(chat("gemini-3.6-flash", temperature=0.2))
+
+    assert result.status_code == 200
+    assert result.body == FALLBACK_COMPLETION
+    assert (result.provider, result.model) == ("ollama", "qwen2.5")
+    assert gemini.call_count == 3  # the first try + MAX_RETRIES=2
+    assert tries(result) == [("gemini", 503)] * 3 + [("ollama", 200)]
+    sent = ollama.calls.last.request
+    assert "Authorization" not in sent.headers  # Gemini's key never goes to the fallback
+    assert json.loads(sent.content) == chat("qwen2.5", temperature=0.2)
+
+
+@pytest.mark.parametrize("status", [400, 401, 404])
+@respx.mock
+async def test_client_errors_are_not_retried_and_do_not_fall_back(service, status):
+    gemini = respx.post(GEMINI_URL).mock(
+        return_value=httpx.Response(status, json={"error": {"message": "nope"}})
+    )
+
+    result = await service.complete(chat("gemini-3.6-flash"))
+
+    # respx.mock would also fail on the unmocked Ollama call if it had fallen back.
+    assert result.status_code == status
+    assert gemini.call_count == 1
+    assert tries(result) == [("gemini", status)]
+
+
+@respx.mock
+async def test_long_retry_after_skips_retries_and_falls_back(service):
+    gemini = respx.post(GEMINI_URL).mock(
+        return_value=httpx.Response(429, headers={"Retry-After": "60"})
+    )
+    respx.post(OLLAMA_URL).mock(return_value=httpx.Response(200, json=FALLBACK_COMPLETION))
+
+    result = await service.complete(chat("gemini-3.6-flash"))
+
+    assert result.status_code == 200
+    assert gemini.call_count == 1
+    assert result.provider == "ollama"
+
+
+@respx.mock
+async def test_when_fallback_also_fails_its_error_is_returned(service):
+    respx.post(GEMINI_URL).mock(return_value=httpx.Response(503))
+    respx.post(OLLAMA_URL).mock(side_effect=httpx.ConnectError("connection refused"))
+
+    result = await service.complete(chat("gemini-3.6-flash"))
+
+    assert result.status_code == 502
+    assert result.provider == "ollama"
+    assert result.body["error"]["code"] == "upstream_unavailable"
+    assert tries(result) == [("gemini", 503)] * 3 + [("ollama", 502)] * 3
+
+
+@respx.mock
+async def test_fallback_to_unconfigured_provider_is_skipped():
+    settings = make_settings(fallback_models={"gemini": "anthropic/claude-sonnet-5"})
+    respx.post(GEMINI_URL).mock(return_value=httpx.Response(503))
+    async with httpx.AsyncClient() as http:
+        result = await ChatService(settings, http).complete(chat("gemini-3.6-flash"))
+
+    assert result.status_code == 503
+    assert tries(result) == [("gemini", 503)] * 3
+
+
+@respx.mock
+async def test_stream_falls_back_when_upstream_fails_before_streaming(service):
+    respx.post(GEMINI_URL).mock(return_value=httpx.Response(503))
+    ollama = respx.post(OLLAMA_URL).mock(return_value=sse_response(SSE_EVENTS))
+
+    stream = await service.stream(chat("gemini-3.6-flash", stream=True))
+
+    assert await collect(stream) == b"".join(SSE_EVENTS)
+    assert (stream.provider, stream.model) == ("ollama", "qwen2.5")
+    assert tries(stream) == [("gemini", 503)] * 3 + [("ollama", 200)]
+    sent = json.loads(ollama.calls.last.request.content)
+    assert (sent["model"], sent["stream_options"]) == ("qwen2.5", {"include_usage": True})
+
+
+@respx.mock
+async def test_stream_broken_before_first_byte_is_retried(service):
+    respx.post(GEMINI_URL).mock(
+        side_effect=[
+            sse_response([], error=httpx.ReadError("connection reset")),
+            sse_response(SSE_EVENTS),
+        ]
+    )
+
+    stream = await service.stream(chat("gemini-3.6-flash", stream=True))
+
+    assert await collect(stream) == b"".join(SSE_EVENTS)
+    assert tries(stream) == [("gemini", 502), ("gemini", 200)]
+    assert "connection reset" in stream.attempts[0].error_message
+    assert stream.error_message is None
+
+
+@respx.mock
+async def test_stream_broken_after_first_byte_is_not_retried(service):
+    gemini = respx.post(GEMINI_URL).mock(
+        return_value=sse_response(SSE_EVENTS[:1], error=httpx.ReadError("connection reset"))
+    )
+
+    stream = await service.stream(chat("gemini-3.6-flash", stream=True))
+    relayed = await collect(stream)
+
+    # The client already has the first bytes, so switching provider would corrupt its answer.
+    assert relayed.startswith(SSE_EVENTS[0])
+    assert "connection reset" in stream.error_message
+    assert gemini.call_count == 1
+    assert tries(stream) == [("gemini", 200)]
