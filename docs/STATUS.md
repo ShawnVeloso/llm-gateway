@@ -10,16 +10,17 @@ Stage 1 - pass-through + logging, on branch `feature/stage-1-server`. Stage 0 me
 - `request_log.py`: `LoggedChat` wraps `ChatService`, one `requests` row per chat request (app from `X-App-Name`, tokens only if reported, latency, TTFT, status, redacted error, content only with `LOG_CONTENT=true`). Stream rows written on end or client disconnect (decision 0005).
 - Live-checked with Ollama: normal, streaming, long stream, curl disconnect mid-stream; rows correct.
 - README: setup, run, client setup, request log, empty Results section.
-- Live-checked the not-configured path: with no `GEMINI_API_KEY`, `gemini-2.5-flash` (normal + streaming) returns 400 `provider_not_configured`.
+- Live-checked with Gemini (`gemini-3.6-flash`): normal + streaming 200 with tokens and TTFT logged; no key -> 400 `provider_not_configured`; retired model -> upstream 404 passed through and logged; no key strings in the DB. Stage 1 acceptance met.
 
 ## Next step
-Last Stage 1 item: owner adds `GEMINI_API_KEY` to `.env`, then live curl `gemini-2.5-flash` normal + streaming through the gateway and confirm both rows (tokens, TTFT) in `data/gateway.db`. Then open the Stage 1 PR.
+Owner opens and merges the Stage 1 PR from `feature/stage-1-server`. Then Stage 2 (retries + fallback), see `docs/ROADMAP.md`.
 
 ## Open questions
 - Does Lithe call `GET /v1/models`? (Not in Stage 1 unless needed.)
 
 ## Known issues
-- Live Gemini check blocked on a missing key (see Next step); Gemini's OpenAI-compat endpoint is beta and its streaming usage chunk / error shape are not fully documented.
+- Gemini's OpenAI-compat endpoint is beta. Observed: it puts `usage` on every stream chunk (no separate final chunk), and `total_tokens` includes thinking tokens that `completion_tokens` does not (e.g. 5 out, 296 total). We store only input/output, so thinking tokens are not logged yet; matters for Stage 4 cost.
+- `gemini-2.5-flash` is no longer available to new keys; use `gemini-3.6-flash`.
 - Anthropic's OpenAI-compat layer is not production-grade and ignores some fields (decision 0004).
 - Requests rejected before the service (invalid JSON body) are not logged.
 - Don't replace `SSEResponse`'s `finally` close with a `BackgroundTask`, or the shielded write with plain `to_thread`: both lose rows on client disconnect (decision 0005).

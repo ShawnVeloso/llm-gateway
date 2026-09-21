@@ -46,7 +46,7 @@ Example (PowerShell):
 ```powershell
 curl.exe http://127.0.0.1:8787/v1/chat/completions `
   -H "Content-Type: application/json" -H "X-App-Name: curl" `
-  -d '{\"model\": \"gemini-2.5-flash\", \"messages\": [{\"role\": \"user\", \"content\": \"Hi\"}]}'
+  -d '{\"model\": \"gemini-3.6-flash\", \"messages\": [{\"role\": \"user\", \"content\": \"Hi\"}]}'
 ```
 Add `\"stream\": true` to the body for streaming (Server-Sent Events).
 
