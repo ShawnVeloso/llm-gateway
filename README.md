@@ -57,14 +57,23 @@ If a provider fails in a way that might pass (can't connect, timeout, HTTP 429 o
 
 Errors that won't fix themselves (a bad model name, a wrong or missing key) are returned straight away, with no retry or fallback. A stream can only retry or fall back before its first bytes reach your app; after that, a failure ends the stream with an error event.
 
+## Response cache
+If an app sends exactly the same request again (same model, messages and parameters; key order and spacing don't matter) within an hour, the gateway answers from its cache instead of calling the provider. That's instant and costs no tokens. Streams are cached too and replayed as the same events. Only successful answers from the model you asked for are cached: errors, broken streams and fallback answers never are. Change the time with `CACHE_TTL_SECONDS`, or turn the cache off with `CACHE_ENABLED=false`.
+
+Every response has an `X-Cache` header: `HIT`, `MISS`, or `BYPASS`. To skip the cache for one request, send one of these headers:
+- `Cache-Control: no-cache`: get a fresh answer. It is still stored, so the next identical request gets the new one. Use it for "regenerate".
+- `Cache-Control: no-store`: get a fresh answer and don't store it.
+
+Cached responses live in the `cache` table of the same DB file until they expire, **even when `LOG_CONTENT=false`**.
+
 ## Request log
-Every chat request writes one row to the `requests` table in a SQLite file at `data/gateway.db` (change with `DB_PATH`). A row has: time, request id, app, the model the app asked for, the provider and model that finally served it (or failed last), whether it streamed, input/output tokens (only when the provider reports them, otherwise empty), latency, time to first token for streams, HTTP status, number of upstream attempts, and a redacted error message. Each upstream call, including retries and fallback, is also a row in the `attempts` table, linked by `request_id`.
+Every chat request writes one row to the `requests` table in a SQLite file at `data/gateway.db` (change with `DB_PATH`). A row has: time, request id, app, the model the app asked for, the provider and model that finally served it (or failed last), whether it streamed, input/output tokens (only when the provider reports them, otherwise empty), latency, time to first token for streams, HTTP status, number of upstream attempts (0 for a cache hit), cache status (`hit`/`miss`/`bypass`, empty when caching is off), and a redacted error message. Each upstream call, including retries and fallback, is also a row in the `attempts` table, linked by `request_id`.
 
 Prompt and response text are **not** stored unless you set `LOG_CONTENT=true`. API keys are never stored.
 
 Look at recent rows with any SQLite tool, e.g.:
 ```powershell
-sqlite3 data/gateway.db "SELECT created_at, app, provider, model, is_stream, input_tokens, output_tokens, latency_ms, status_code FROM requests ORDER BY id DESC LIMIT 10"
+sqlite3 data/gateway.db "SELECT created_at, app, provider, model, is_stream, input_tokens, output_tokens, latency_ms, status_code, cache_status FROM requests ORDER BY id DESC LIMIT 10"
 ```
 
 ## Development
