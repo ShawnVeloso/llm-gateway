@@ -52,8 +52,13 @@ Add `\"stream\": true` to the body for streaming (Server-Sent Events).
 
 Errors come back in the OpenAI shape: `{"error": {"message", "type", "code"}}`.
 
+## Retries and fallback
+If a provider fails in a way that might pass (can't connect, timeout, HTTP 429 or 5xx), the gateway tries again, waiting a little longer each time (`MAX_RETRIES`, default 2 retries). If Gemini still fails, the request goes to a local Ollama model instead (`FALLBACK_MODELS`, default `qwen2.5`; run `ollama pull qwen2.5` first). The response's `model` field shows which model actually answered.
+
+Errors that won't fix themselves (a bad model name, a wrong or missing key) are returned straight away, with no retry or fallback. A stream can only retry or fall back before its first bytes reach your app; after that, a failure ends the stream with an error event.
+
 ## Request log
-Every chat request writes one row to the `requests` table in a SQLite file at `data/gateway.db` (change with `DB_PATH`). A row has: time, request id, app, provider, model, whether it streamed, input/output tokens (only when the provider reports them, otherwise empty), latency, time to first token for streams, HTTP status, and a redacted error message.
+Every chat request writes one row to the `requests` table in a SQLite file at `data/gateway.db` (change with `DB_PATH`). A row has: time, request id, app, the model the app asked for, the provider and model that finally served it (or failed last), whether it streamed, input/output tokens (only when the provider reports them, otherwise empty), latency, time to first token for streams, HTTP status, number of upstream attempts, and a redacted error message. Each upstream call, including retries and fallback, is also a row in the `attempts` table, linked by `request_id`.
 
 Prompt and response text are **not** stored unless you set `LOG_CONTENT=true`. API keys are never stored.
 
