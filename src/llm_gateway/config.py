@@ -54,6 +54,14 @@ class Settings(BaseSettings):
 
     request_timeout_seconds: float = Field(default=120.0, gt=0)
 
+    # Retries of transient failures (connect errors, timeouts, 429, 5xx), per provider.
+    max_retries: int = Field(default=2, ge=0)
+    retry_base_delay_seconds: float = Field(default=0.5, ge=0)
+    retry_max_delay_seconds: float = Field(default=8.0, ge=0)
+    # Provider -> model to try once that provider's retries are used up. The model is routed like
+    # a client's, so "ollama/qwen2.5" pins the provider. Fallbacks don't chain.
+    fallback_models: dict[Provider, str] = {"gemini": "ollama/qwen2.5"}
+
     db_path: Path = Path("data/gateway.db")
     log_content: bool = False
 
