@@ -65,6 +65,11 @@ class Settings(BaseSettings):
     db_path: Path = Path("data/gateway.db")
     log_content: bool = False
 
+    # Exact-match response cache, stored in the same DB. Clients skip it per request with a
+    # `Cache-Control: no-cache` (fresh answer, still stored) or `no-store` header.
+    cache_enabled: bool = True
+    cache_ttl_seconds: float = Field(default=3600.0, gt=0)
+
     def endpoint(self, provider: Provider) -> ProviderEndpoint:
         if provider == "ollama":
             return ProviderEndpoint(str(self.ollama_base_url), None, False, None)

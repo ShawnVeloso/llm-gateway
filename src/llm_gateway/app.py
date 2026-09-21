@@ -10,9 +10,10 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from starlette.types import Receive, Scope, Send
 
+from llm_gateway.cache import CacheControl, CachedChat, ResponseCache
 from llm_gateway.config import Settings, get_settings
 from llm_gateway.request_log import LoggedChat, LoggedStream, RequestLog
-from llm_gateway.service import ChatResult, ChatService
+from llm_gateway.service import CacheStatus, ChatResult, ChatService
 
 DEFAULT_APP_NAME = "unknown"
 
@@ -23,10 +24,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         log = RequestLog(settings.db_path)
-        await asyncio.to_thread(log.create)
+        await asyncio.to_thread(log.create)  # also creates the cache table
+        cache = None
+        if settings.cache_enabled:
+            cache = ResponseCache(settings.db_path, settings.cache_ttl_seconds)
         # One client for the whole app so connections to providers are reused across requests.
         async with httpx.AsyncClient(timeout=settings.request_timeout_seconds) as http:
-            app.state.chat = LoggedChat(ChatService(settings, http), log, settings.log_content)
+            chat = CachedChat(ChatService(settings, http), cache)
+            app.state.chat = LoggedChat(chat, log, settings.log_content)
             yield
         await log.wait_for_pending_writes()
 
@@ -46,13 +51,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             return _error(400, "Request body must be a JSON object.", "invalid_request_error")
         chat: LoggedChat = request.app.state.chat
         app_name = request.headers.get("X-App-Name") or DEFAULT_APP_NAME
+        control = CacheControl.from_header(request.headers.get("Cache-Control"))
         if body.get("stream") is not True:
-            result = await chat.complete(body, app_name)
-            return JSONResponse(result.body, status_code=result.status_code)
+            result = await chat.complete(body, app_name, control)
+            return _json(result)
 
-        stream = await chat.stream(body, app_name)
+        stream = await chat.stream(body, app_name, control)
         if isinstance(stream, ChatResult):
-            return JSONResponse(stream.body, status_code=stream.status_code)
+            return _json(stream)
         return SSEResponse(stream)
 
     return app
@@ -67,9 +73,8 @@ class SSEResponse(StreamingResponse):
     """
 
     def __init__(self, stream: LoggedStream) -> None:
-        super().__init__(
-            stream.chunks(), media_type="text/event-stream", headers={"Cache-Control": "no-cache"}
-        )
+        headers = {"Cache-Control": "no-cache", **_cache_header(stream.cache_status)}
+        super().__init__(stream.chunks(), media_type="text/event-stream", headers=headers)
         self._stream = stream
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
@@ -77,6 +82,18 @@ class SSEResponse(StreamingResponse):
             await super().__call__(scope, receive, send)
         finally:
             await self._stream.aclose()
+
+
+def _json(result: ChatResult) -> JSONResponse:
+    return JSONResponse(
+        result.body, status_code=result.status_code, headers=_cache_header(result.cache_status)
+    )
+
+
+def _cache_header(status: CacheStatus | None) -> dict[str, str]:
+    """`X-Cache: HIT`, `MISS` or `BYPASS`, so a client (or you, with curl) can see what happened.
+    Left out while caching is off."""
+    return {"X-Cache": status.upper()} if status else {}
 
 
 def _error(status: int, message: str, error_type: str, code: str | None = None) -> JSONResponse:
