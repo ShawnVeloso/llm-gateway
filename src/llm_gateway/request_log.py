@@ -1,5 +1,6 @@
-"""One SQLite row per request. `LoggedChat` wraps `ChatService` with the same two calls, timing
-each request and writing its row once the response (or stream) is finished."""
+"""One SQLite row per request. `LoggedChat` wraps `CachedChat` with the same two calls, timing
+each request and writing its row once the response (or stream) is finished. The same DB holds the
+response cache; its schema is here too, in `MIGRATIONS`."""
 
 import asyncio
 import json
@@ -14,7 +15,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal
 
-from llm_gateway.service import Attempt, ChatResult, ChatService, ChatStream
+from llm_gateway.cache import USE_CACHE, CacheControl, CachedChat
+from llm_gateway.service import Attempt, CacheStatus, ChatResult, ChatStream
 
 logger = logging.getLogger(__name__)
 
@@ -59,18 +61,31 @@ MIGRATIONS = [
     );
     CREATE INDEX attempts_request_id ON attempts (request_id);
     """,
+    # 3 (Stage 3): response cache. `cache_status` is NULL for older rows and while caching is off.
+    """
+    ALTER TABLE requests ADD COLUMN cache_status TEXT;  -- 'hit', 'miss' or 'bypass'
+    CREATE TABLE cache (
+        key TEXT PRIMARY KEY,         -- SHA-256 of the normalized request (cache.cache_key)
+        created_at TEXT NOT NULL,     -- UTC, ISO 8601
+        expires_at REAL NOT NULL,     -- Unix time; expired rows are ignored, deleted on writes
+        provider TEXT NOT NULL,       -- who served the stored response
+        model TEXT NOT NULL,          -- name sent upstream
+        response BLOB NOT NULL        -- JSON body, or a stream's raw SSE bytes
+    );
+    CREATE INDEX cache_expires_at ON cache (expires_at);
+    """,
 ]
 
 
 INSERT = """
 INSERT INTO requests (
     request_id, created_at, app, provider, model, requested_model, is_stream, input_tokens,
-    output_tokens, latency_ms, ttft_ms, status_code, error_message, attempt_count,
+    output_tokens, latency_ms, ttft_ms, status_code, error_message, attempt_count, cache_status,
     request_content, response_content
 ) VALUES (
     :request_id, :created_at, :app, :provider, :model, :requested_model, :is_stream, :input_tokens,
     :output_tokens, :latency_ms, :ttft_ms, :status_code, :error_message, :attempt_count,
-    :request_content, :response_content
+    :cache_status, :request_content, :response_content
 )
 """
 
@@ -98,6 +113,7 @@ class RequestRecord:
     ttft_ms: float | None
     status_code: int
     error_message: str | None
+    cache_status: CacheStatus | None
     request_content: str | None
     response_content: str | None
     attempts: tuple[Attempt, ...]  # written to the `attempts` table; the count to `requests`
@@ -164,14 +180,16 @@ class RequestLog:
 
 
 class LoggedChat:
-    def __init__(self, chat: ChatService, log: RequestLog, log_content: bool) -> None:
+    def __init__(self, chat: CachedChat, log: RequestLog, log_content: bool) -> None:
         self._chat = chat
         self._log = log
         self._log_content = log_content
 
-    async def complete(self, body: dict[str, Any], app: str) -> ChatResult:
+    async def complete(
+        self, body: dict[str, Any], app: str, control: CacheControl = USE_CACHE
+    ) -> ChatResult:
         start = _Start.now()
-        result = await self._chat.complete(body)
+        result = await self._chat.complete(body, control)
         usage = result.body.get("usage")
         await self._log.write(
             self._record(
@@ -186,9 +204,11 @@ class LoggedChat:
         )
         return result
 
-    async def stream(self, body: dict[str, Any], app: str) -> "ChatResult | LoggedStream":
+    async def stream(
+        self, body: dict[str, Any], app: str, control: CacheControl = USE_CACHE
+    ) -> "ChatResult | LoggedStream":
         start = _Start.now()
-        stream = await self._chat.stream(body)
+        stream = await self._chat.stream(body, control)
         if isinstance(stream, ChatResult):
             await self._log.write(
                 self._record(start, app, body, stream, is_stream=True, usage=None)
@@ -207,7 +227,9 @@ class LoggedChat:
         if error is None and not finished:
             error = CLIENT_DISCONNECTED
         # 200 because that's the status the client already received.
-        result = ChatResult(200, {}, stream.provider, stream.model, error, stream.attempts)
+        result = ChatResult(
+            200, {}, stream.provider, stream.model, error, stream.attempts, stream.cache_status
+        )
         ttft = None
         if stream.first_chunk_at is not None:
             ttft = (stream.first_chunk_at - start.perf) * 1000
@@ -249,6 +271,7 @@ class LoggedChat:
             ttft_ms=ttft_ms,
             status_code=result.status_code,
             error_message=result.error_message,
+            cache_status=result.cache_status,
             request_content=json.dumps(body.get("messages")) if self._log_content else None,
             response_content=(response_text or None) if self._log_content else None,
             attempts=result.attempts,
@@ -266,6 +289,10 @@ class LoggedStream:
         self._log = log
         self._finished = False
         self._closed = False
+
+    @property
+    def cache_status(self) -> CacheStatus | None:
+        return self._stream.cache_status
 
     async def chunks(self) -> AsyncIterator[bytes]:
         try:

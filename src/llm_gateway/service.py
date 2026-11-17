@@ -1,6 +1,6 @@
 """Request logic behind `/v1/chat/completions`: route, forward with retries and fallback, and turn
-every failure into an OpenAI-style error. Logging (`request_log.LoggedChat`) and later stages
-(cache) wrap `ChatService.complete` and `ChatService.stream`."""
+every failure into an OpenAI-style error. The cache (`cache.CachedChat`) wraps `ChatService`, and
+logging (`request_log.LoggedChat`) wraps the cache, each with the same `complete` and `stream`."""
 
 import asyncio
 import json
@@ -8,7 +8,7 @@ import logging
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass, replace
-from typing import Any, cast
+from typing import Any, Literal, cast
 
 import httpx
 
@@ -20,6 +20,9 @@ from llm_gateway.routing import ProviderNotConfiguredError, Route, resolve_route
 logger = logging.getLogger(__name__)
 
 MAX_UPSTREAM_ERROR_CHARS = 500
+
+# Set by the cache layer; None when caching is off. "bypass": the client asked to skip it.
+CacheStatus = Literal["hit", "miss", "bypass"]
 
 
 @dataclass(frozen=True)
@@ -41,6 +44,7 @@ class ChatResult:
     model: str | None = None  # name sent upstream
     error_message: str | None = None  # already redacted; safe to log
     attempts: tuple[Attempt, ...] = ()
+    cache_status: CacheStatus | None = None
 
 
 class ChatStream:
@@ -55,6 +59,10 @@ class ChatStream:
         self.first_chunk_at: float | None = None  # time.perf_counter() of the first body bytes
         self.error_message: str | None = None  # set if the stream broke part-way; redacted
         self.content_parts: list[str] = []  # assistant text deltas, in order
+        self.cache_status: CacheStatus | None = None
+        # Called with every byte relayed, once the stream has ended cleanly (not on errors or a
+        # client disconnect). The cache uses it to store the stream.
+        self.on_complete: Callable[[bytes], Awaitable[None]] | None = None
         self._response = response
         self._secrets = secrets
         self._body = response.aiter_bytes()
@@ -76,13 +84,18 @@ class ChatStream:
 
     async def chunks(self) -> AsyncIterator[bytes]:
         """Yield the provider's bytes unchanged, as they arrive. Call `start()` first."""
+        received: list[bytes] = []
         try:
             if self._first:
+                received.append(self._first)
                 yield self._first
             async for chunk in self._body:
                 self._scan(chunk)
+                received.append(chunk)
                 yield chunk
             self._scan_line(self._buffer)
+            if self.on_complete:
+                await self.on_complete(b"".join(received))
         except httpx.HTTPError as exc:
             # Headers (200) are already sent, so the status can't change. Tell the client in-band,
             # the way OpenAI reports mid-stream errors.
