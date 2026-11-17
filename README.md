@@ -83,4 +83,11 @@ uv run ruff check .
 ```
 
 ## Results
-_Real measurements go here later._
+Live check of the response cache against a local Ollama `llama3.2`, on a fresh database (see `docs/STATUS.md`):
+
+| Request | First call (`X-Cache: MISS`) | Repeat (`X-Cache: HIT`) |
+|---|---|---|
+| Normal | 27.3 s (includes Ollama loading the model) | 4.7 ms |
+| Streaming | 125 ms (model already loaded) | 4.5 ms |
+
+`Cache-Control: no-cache` returned `X-Cache: BYPASS` as expected. These are single runs on one PC, not a benchmark.
